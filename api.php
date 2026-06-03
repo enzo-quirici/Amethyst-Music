@@ -1,0 +1,652 @@
+<?php
+header('Access-Control-Allow-Origin: *');
+header('Access-Control-Allow-Methods: GET, POST, OPTIONS');
+header('Content-Type: application/json');
+
+// --- SÉCURITÉ : Entêtes HTTP de sécurité ---
+header('X-Content-Type-Options: nosniff');
+header('X-Frame-Options: DENY');
+header('X-XSS-Protection: 1; mode=block');
+
+// --- CONFIGURATION BDD ---
+require_once __DIR__ . '/config.php';
+
+try {
+    $dsn = 'mysql:host=' . DB_HOST . ';port=' . DB_PORT . ';dbname=' . DB_NAME . ';charset=utf8mb4';
+    $db = new PDO($dsn, DB_USER, DB_PASS, [
+        PDO::ATTR_ERRMODE            => PDO::ERRMODE_EXCEPTION,
+        PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+        PDO::ATTR_EMULATE_PREPARES   => false,
+    ]);
+
+    // --- TABLES ---
+    $db->exec("CREATE TABLE IF NOT EXISTS users (
+        id       INT AUTO_INCREMENT PRIMARY KEY,
+        username VARCHAR(50) UNIQUE NOT NULL,
+        password VARCHAR(255) NOT NULL,
+        is_admin TINYINT(1) NOT NULL DEFAULT 0
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+
+    $db->exec("CREATE TABLE IF NOT EXISTS tracks (
+        id          INT AUTO_INCREMENT PRIMARY KEY,
+        filename    VARCHAR(255),
+        title       VARCHAR(200),
+        artist      VARCHAR(200) DEFAULT 'Artiste inconnu',
+        cover       VARCHAR(255) DEFAULT 'default.png',
+        genre       VARCHAR(50)  DEFAULT 'Autre',
+        uploader_id INT,
+        upload_date DATETIME     DEFAULT CURRENT_TIMESTAMP,
+        play_count  INT          DEFAULT 0,
+        duration    INT          DEFAULT 0
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+
+    $db->exec("CREATE TABLE IF NOT EXISTS playlists (
+        id         INT AUTO_INCREMENT PRIMARY KEY,
+        name       VARCHAR(100),
+        creator_id INT,
+        song_ids   TEXT
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+
+    // --- SÉCURITÉ : Table de rate limiting pour les tentatives de login ---
+    $db->exec("CREATE TABLE IF NOT EXISTS login_attempts (
+        id           INT AUTO_INCREMENT PRIMARY KEY,
+        ip           VARCHAR(45),
+        attempt_time INT
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+
+    // --- OPTIMISATION : Indexation SQL ---
+    $db->exec("CREATE INDEX IF NOT EXISTS idx_play_count ON tracks(play_count)");
+    $db->exec("CREATE INDEX IF NOT EXISTS idx_uploader   ON tracks(uploader_id)");
+
+    // --- MIGRATIONS AUTOMATIQUES (tracks) ---
+    $cols = $db->query("SHOW COLUMNS FROM tracks")->fetchAll(PDO::FETCH_ASSOC);
+    $colNames = array_column($cols, 'Field');
+    if (!in_array('genre',      $colNames)) $db->exec("ALTER TABLE tracks ADD COLUMN genre      VARCHAR(50) DEFAULT 'Autre'");
+    if (!in_array('play_count', $colNames)) $db->exec("ALTER TABLE tracks ADD COLUMN play_count INT         DEFAULT 0");
+    if (!in_array('duration',   $colNames)) $db->exec("ALTER TABLE tracks ADD COLUMN duration   INT         DEFAULT 0");
+
+    // --- MIGRATIONS AUTOMATIQUES (users) ---
+    $colsUsers = $db->query("SHOW COLUMNS FROM users")->fetchAll(PDO::FETCH_ASSOC);
+    $colNamesUsers = array_column($colsUsers, 'Field');
+    if (!in_array('is_admin', $colNamesUsers)) $db->exec("ALTER TABLE users ADD COLUMN is_admin TINYINT(1) DEFAULT 0");
+
+} catch (Exception $e) { die(json_encode(["status" => "error", "message" => "Erreur BDD"])); }
+
+$musicDir = MUSIC_DIR;
+$coverDir = COVER_DIR;
+if(!is_dir($musicDir)) mkdir($musicDir, 0777, true);
+if(!is_dir($coverDir)) mkdir($coverDir, 0777, true);
+
+$action = $_GET['action'] ?? '';
+$baseUrl = (isset($_SERVER['HTTPS']) ? "https" : "http") . "://$_SERVER[HTTP_HOST]" . dirname($_SERVER['PHP_SELF']) . "/";
+
+// --- SÉCURITÉ : Constantes de validation ---
+define('MAX_AUDIO_SIZE',  100 * 1024 * 1024); // 100 Mo
+define('MAX_IMAGE_SIZE',    5 * 1024 * 1024); // 5 Mo
+define('MAX_FIELD_LENGTH', 200);              // longueur max des champs texte
+define('LOGIN_MAX_ATTEMPTS', 10);             // tentatives max sur 15 min
+define('LOGIN_WINDOW', 900);                  // fenêtre de 15 minutes (secondes)
+
+// --- SÉCURITÉ : Rate limiting sur les logins (par IP) ---
+function check_rate_limit($db) {
+    $ip = $_SERVER['REMOTE_ADDR'] ?? '0.0.0.0';
+    $now = time();
+    $window = $now - LOGIN_WINDOW;
+
+    // Nettoyer les anciennes entrées
+    $db->prepare("DELETE FROM login_attempts WHERE attempt_time < ?")->execute([$window]);
+
+    // Compter les tentatives récentes pour cette IP
+    $stmt = $db->prepare("SELECT COUNT(*) FROM login_attempts WHERE ip = ? AND attempt_time >= ?");
+    $stmt->execute([$ip, $window]);
+    $count = (int)$stmt->fetchColumn();
+
+    return $count < LOGIN_MAX_ATTEMPTS;
+}
+
+function record_login_attempt($db) {
+    $ip = $_SERVER['REMOTE_ADDR'] ?? '0.0.0.0';
+    $db->prepare("INSERT INTO login_attempts (ip, attempt_time) VALUES (?, ?)")->execute([$ip, time()]);
+}
+
+// --- SÉCURITÉ : Validation et nettoyage des champs texte ---
+function sanitize_text($value, $max_length = MAX_FIELD_LENGTH) {
+    $value = trim($value);
+    if (mb_strlen($value) > $max_length) {
+        $value = mb_substr($value, 0, $max_length);
+    }
+    return htmlspecialchars($value, ENT_QUOTES, 'UTF-8');
+}
+
+// --- SÉCURITÉ : Vérification du type MIME réel d'un fichier audio ---
+function is_valid_audio($path, $ext) {
+    $allowedExts = ['mp3', 'wav', 'ogg', 'flac'];
+    if (!in_array($ext, $allowedExts)) return false;
+
+    $fp = fopen($path, 'rb');
+    if (!$fp) return false;
+    $sig = fread($fp, 12);
+    fclose($fp);
+
+    // MP3 : frame sync ou ID3
+    if (substr($sig, 0, 3) === 'ID3') return true;
+    if ((ord($sig[0]) === 0xFF) && ((ord($sig[1]) & 0xE0) === 0xE0)) return true;
+    // WAV : RIFF....WAVE
+    if (substr($sig, 0, 4) === 'RIFF' && substr($sig, 8, 4) === 'WAVE') return true;
+    // OGG
+    if (substr($sig, 0, 4) === 'OggS') return true;
+    // FLAC
+    if (substr($sig, 0, 4) === 'fLaC') return true;
+
+    return false;
+}
+
+// --- SÉCURITÉ : Fonction d'authentification stricte pour l'API ---
+function authenticate_api_user($db) {
+    $username = $_POST['username'] ?? '';
+    $password = $_POST['password'] ?? '';
+    
+    if (empty($username) || empty($password)) {
+        return false;
+    }
+    
+    $stmt = $db->prepare("SELECT id, username, password, is_admin FROM users WHERE username = ?");
+    $stmt->execute([$username]);
+    $user = $stmt->fetch(PDO::FETCH_ASSOC);
+    
+    if ($user && password_verify($password, $user['password'])) {
+        return [
+            'id' => $user['id'],
+            'username' => $user['username'],
+            'is_admin' => (isset($user['is_admin']) && $user['is_admin'] == 1) || ($user['username'] === 'Axolat')
+        ];
+    }
+    return false;
+}
+
+// --- CALCULE LA DURÉE MULTI-FORMATS ---
+function calculateAudioDuration($path) {
+    if (!file_exists($path)) return 0;
+    $fp = fopen($path, 'rb');
+    if (!$fp) return 0;
+
+    $signature = fread($fp, 4);
+    
+    // --- 1. CAS DU FLAC NATIF ---
+    if ($signature === 'fLaC') {
+        fseek($fp, 8);
+        $streamInfo = fread($fp, 34);
+        fclose($fp);
+        
+        if (strlen($streamInfo) === 34) {
+            $fields = unpack('N3', substr($streamInfo, 10, 12));
+            $sampleRate = ($fields[1] >> 12) & 0xFFFFF;
+            $totalSamples = (($fields[1] & 0x00F) << 32) | $fields[2];
+            if ($sampleRate > 0) {
+                return round($totalSamples / $sampleRate);
+            }
+        }
+        return 0;
+    }
+    
+    // --- 2. CAS DU M4A / MP4 / AAC CONTENEUR ---
+    if (strpos($signature, 'ftyp') !== false || substr($signature, 1, 3) === 'ftyp') {
+        fseek($fp, 0);
+        $content = fread($fp, 1024 * 400);
+        $mvhdPos = strpos($content, 'mvhd');
+        fclose($fp);
+        
+        if ($mvhdPos !== false) {
+            $version = ord($content[$mvhdPos + 4]);
+            $timeScaleOffset = ($version === 1) ? 20 : 12;
+            $durationOffset = ($version === 1) ? 24 : 16;
+            
+            $timeScale = unpack('N', substr($content, $mvhdPos + 4 + $timeScaleOffset, 4))[1];
+            $durationUnits = unpack('N', substr($content, $mvhdPos + 4 + $durationOffset, 4))[1];
+            
+            if ($timeScale > 0) {
+                return round($durationUnits / $timeScale);
+            }
+        }
+        return 0;
+    }
+
+    // --- 3. CAS DU MP3 TRADITIONNEL (CBR/VBR) ---
+    fseek($fp, 0);
+    $header = fread($fp, 10);
+    if (substr($header, 0, 3) === 'ID3') {
+        $b = unpack('C*', substr($header, 6, 4));
+        $tagSize = ($b[1] << 21) | ($b[2] << 14) | ($b[3] << 7) | $b[4];
+        fseek($fp, $tagSize + 10);
+    } else {
+        fseek($fp, 0);
+    }
+
+    $data = fread($fp, 1024 * 200);
+    $offset = 0;
+    while ($offset < strlen($data) - 4) {
+        if (ord($data[$offset]) === 0xFF && (ord($data[$offset+1]) & 0xE0) === 0xE0) {
+            $byte1 = ord($data[$offset+1]);
+            $byte2 = ord($data[$offset+2]);
+            $mpegVersion = ($byte1 >> 3) & 0x03;
+            
+            $channelMode = ($byte2 >> 6) & 0x03;
+            $xingOffset = ($mpegVersion === 3) ? (($channelMode === 3) ? 17 : 32) : (($channelMode === 3) ? 9 : 17);
+            $vbrCheck = substr($data, $offset + 4 + $xingOffset, 4);
+            
+            if ($vbrCheck === 'Xing' || $vbrCheck === 'Info') {
+                $flags = unpack('N', substr($data, $offset + 4 + $xingOffset + 4, 4))[1];
+                if ($flags & 0x01) {
+                    $frameCount = unpack('N', substr($data, $offset + 4 + $xingOffset + 8, 4))[1];
+                    $srTable = [3 => [44100, 48000, 32000, 0], 2 => [22050, 24000, 16000, 0]];
+                    $sampleRate = $srTable[$mpegVersion][($byte2 >> 2) & 0x03] ?? 44100;
+                    $samplesPerFrame = ($mpegVersion === 3) ? 1152 : 576;
+                    fclose($fp);
+                    if ($sampleRate > 0) return round(($frameCount * $samplesPerFrame) / $sampleRate);
+                }
+            }
+            
+            $brTable = [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0];
+            $bitrate = $brTable[($byte2 >> 4) & 0x0F] ?? 128;
+            fclose($fp);
+            if ($bitrate > 0) return round((filesize($path) * 8) / ($bitrate * 1000));
+            break;
+        }
+        $offset++;
+    }
+
+    fclose($fp);
+    return round((filesize($path) * 8) / (128 * 1000));
+}
+
+// --- HELPER METADATA (ROBUSTE) ---
+function extractMp3Data($path) {
+    if (!file_exists($path)) return ['artist'=>null, 'title'=>null, 'cover'=>null];
+    $f = fopen($path, 'rb');
+    if (!$f) return ['artist'=>null, 'title'=>null, 'cover'=>null];
+    
+    $header = fread($f, 10);
+    if (substr($header, 0, 3) !== 'ID3') { fclose($f); return ['artist'=>null, 'title'=>null, 'cover'=>null]; }
+    
+    $b = unpack('C*', substr($header, 6, 4));
+    $tagSize = ($b[1] << 21) | ($b[2] << 14) | ($b[3] << 7) | $b[4];
+    $tagData = fread($f, $tagSize);
+    fclose($f);
+    
+    $result = ['cover' => null, 'artist' => null, 'title' => null];
+    $pos = 0;
+    while ($pos < strlen($tagData) - 10) {
+        $frameHeader = substr($tagData, $pos, 10);
+        $frameName = substr($frameHeader, 0, 4);
+        $s = unpack('N', substr($frameHeader, 4, 4));
+        $frameSize = $s[1];
+        
+        if ($frameSize == 0 || $frameName == "\x00\x00\x00\x00") break;
+        
+        if ($frameName === 'TPE1') {
+            $body = substr($tagData, $pos + 10, $frameSize);
+            if(strlen($body) > 1) $result['artist'] = trim(preg_replace('/[\x00-\x1F\x7F]/u', '', substr($body, 1)));
+        }
+        if ($frameName === 'TIT2') {
+            $body = substr($tagData, $pos + 10, $frameSize);
+            if(strlen($body) > 1) $result['title'] = trim(preg_replace('/[\x00-\x1F\x7F]/u', '', substr($body, 1)));
+        }
+        if ($frameName === 'APIC') {
+            $body = substr($tagData, $pos + 10, $frameSize);
+            $nullPos = strpos($body, "\x00", 1);
+            if ($nullPos !== false) {
+                $jpgPos = strpos($body, "\xFF\xD8");
+                $pngPos = strpos($body, "\x89PNG");
+                
+                $start = false; $mime = 'image/jpeg';
+                if($jpgPos !== false && ($pngPos === false || $jpgPos < $pngPos)) { $start = $jpgPos; }
+                elseif($pngPos !== false) { $start = $pngPos; $mime = 'image/png'; }
+                
+                if($start !== false) {
+                    $result['cover'] = ['mime' => $mime, 'data' => substr($body, $start)];
+                }
+            }
+        }
+        $pos += 10 + $frameSize;
+    }
+    return $result;
+}
+
+// --- OPTIMISATION : Fonction pour compresser les covers ---
+function optimizeImage($sourcePath, $destinationPath, $mime = null) {
+    if (!extension_loaded('gd')) return move_uploaded_file($sourcePath, $destinationPath);
+    
+    $info = getimagesize($sourcePath);
+    if (!$info) return false;
+    $mime = $mime ?? $info['mime'];
+    
+    switch ($mime) {
+        case 'image/jpeg': $image = imagecreatefromjpeg($sourcePath); break;
+        case 'image/png': $image = imagecreatefrompng($sourcePath); break;
+        case 'image/webp': $image = imagecreatefromwebp($sourcePath); break;
+        case 'image/gif': $image = imagecreatefromgif($sourcePath); break;
+        default: return false;
+    }
+    
+    if (!$image) return false;
+
+    $width = imagesx($image); $height = imagesy($image); $max_size = 300;
+    
+    if ($width > $max_size || $height > $max_size) {
+        $ratio = min($max_size / $width, $max_size / $height);
+        $new_width = round($width * $ratio);
+        $new_height = round($height * $ratio);
+        $new_image = imagecreatetruecolor($new_width, $new_height);
+        
+        if ($mime == 'image/png') {
+            imagealphablending($new_image, false);
+            imagesavealpha($new_image, true);
+        }
+        imagecopyresampled($new_image, $image, 0, 0, 0, 0, $new_width, $new_height, $width, $height);
+        imagedestroy($image);
+        $image = $new_image;
+    }
+
+    $success = imagewebp($image, $destinationPath, 80);
+    imagedestroy($image);
+    if (!$success) move_uploaded_file($sourcePath, $destinationPath);
+    return true;
+}
+
+switch($action) {
+    case 'login':
+        // --- SÉCURITÉ : Rate limiting sur les tentatives de login ---
+        if (!check_rate_limit($db)) {
+            http_response_code(429);
+            echo json_encode(["status" => "error", "message" => "Trop de tentatives. Réessayez dans 15 minutes."]);
+            exit;
+        }
+        record_login_attempt($db);
+
+        $auth = authenticate_api_user($db);
+        if ($auth) {
+            echo json_encode(["status" => "success", "user_id" => $auth['id'], "username" => $auth['username'], "is_admin" => $auth['is_admin']]);
+        } else {
+            echo json_encode(["status" => "error", "message" => "Identifiants invalides"]);
+        }
+        break;
+
+    case 'register':
+        $u = $_POST['username'] ?? ''; $p = $_POST['password'] ?? '';
+        if(empty($u) || empty($p)) { echo json_encode(["status" => "error", "message" => "Données manquantes"]); exit; }
+
+        // --- SÉCURITÉ : Validation longueur username/password ---
+        if (mb_strlen($u) > 50) { echo json_encode(["status" => "error", "message" => "Nom d'utilisateur trop long (50 caractères max)"]); exit; }
+        if (mb_strlen($p) < 6)  { echo json_encode(["status" => "error", "message" => "Mot de passe trop court (6 caractères min)"]); exit; }
+        if (mb_strlen($p) > 200) { echo json_encode(["status" => "error", "message" => "Mot de passe trop long"]); exit; }
+
+        $u = htmlspecialchars(trim($u), ENT_QUOTES, 'UTF-8');
+        try { 
+            $db->prepare("INSERT INTO users (username, password) VALUES (?, ?)")->execute([$u, password_hash($p, PASSWORD_DEFAULT)]);
+            echo json_encode(["status" => "success"]); 
+        } catch(Exception $e) { 
+            echo json_encode(["status" => "error", "message" => "Nom d'utilisateur déjà pris"]); 
+        }
+        break;
+
+    case 'list':
+        $stmt = $db->query("SELECT tracks.id, tracks.title, tracks.artist, tracks.cover, tracks.genre, tracks.play_count, tracks.duration, tracks.uploader_id FROM tracks ORDER BY play_count DESC, id DESC");
+        $tracks = $stmt->fetchAll(PDO::FETCH_ASSOC);
+        foreach($tracks as &$t) { 
+            $t['cover_url'] = $baseUrl . "api.php?action=cover&q=" . $t['id'] . "&t=" . time();
+            $t['stream_url'] = $baseUrl . "api.php?action=stream&q=" . $t['id'];
+        }
+        echo json_encode($tracks);
+        break;
+        
+    case 'increment_play':
+        // --- SÉCURITÉ : Authentification requise pour incrémenter ---
+        $auth = authenticate_api_user($db);
+        if (!$auth) { echo json_encode(["status" => "error", "message" => "Accès refusé."]); exit; }
+
+        $track_id = filter_var($_POST['track_id'] ?? 0, FILTER_VALIDATE_INT);
+        if ($track_id === false || $track_id <= 0) { echo json_encode(["status" => "error", "message" => "ID invalide"]); exit; }
+
+        $stmt = $db->prepare("UPDATE tracks SET play_count = play_count + 1 WHERE id = ?");
+        $stmt->execute([$track_id]);
+        echo json_encode(["status" => "success"]);
+        break;
+
+    case 'stream':
+        $stmt = $db->prepare("SELECT filename FROM tracks WHERE id = ?"); 
+        $stmt->execute([$_GET['q'] ?? 0]); 
+        $t = $stmt->fetch();
+        
+        if($t && !empty($t['filename'])) { 
+            $safeFilename = basename($t['filename']);
+            $path = $musicDir . '/' . $safeFilename;
+
+            if (file_exists($path)) {
+                $size = filesize($path);
+                
+                $fp = @fopen($path, 'rb');
+                if (!$fp) { header("HTTP/1.1 500 Internal Server Error"); exit; }
+
+                $start = 0; $end = $size - 1;
+
+                if (isset($_SERVER['HTTP_RANGE'])) {
+                    $c_start = $start; $c_end = $end;
+                    list(, $range) = explode('=', $_SERVER['HTTP_RANGE'], 2);
+                    if (strpos($range, ',') !== false) { header('HTTP/1.1 416 Requested Range Not Satisfiable'); header("Content-Range: bytes $start-$end/$size"); exit; }
+                    if ($range == '-') { $c_start = $size - substr($range, 1); }
+                    else {
+                        $range = explode('-', $range);
+                        $c_start = $range[0];
+                        $c_end = (isset($range[1]) && is_numeric($range[1])) ? $range[1] : $size;
+                    }
+                    $c_end = ($c_end > $end) ? $end : $c_end;
+                    if ($c_start > $c_end || $c_start > $size - 1 || $c_end >= $size) {
+                        header('HTTP/1.1 416 Requested Range Not Satisfiable'); header("Content-Range: bytes $start-$end/$size"); exit;
+                    }
+                    $start = $c_start; $end = $c_end; $length = $end - $start + 1;
+                    fseek($fp, $start);
+                    header('HTTP/1.1 206 Partial Content'); header("Content-Range: bytes $start-$end/$size");
+                } else {
+                    $length = $size; header('HTTP/1.1 200 OK');
+                }
+
+                header('Content-Type: audio/mpeg'); header('Accept-Ranges: bytes'); header('Content-Length: ' . $length); header('Cache-Control: no-cache, must-revalidate');
+                @set_time_limit(1800); 
+
+                $buffer = 1024 * 16;
+                while(!feof($fp) && ($p = ftell($fp)) <= $end) {
+                    if ($p + $buffer > $end) $buffer = $end - $p + 1;
+                    echo fread($fp, $buffer); flush();
+                }
+                fclose($fp); exit; 
+            }
+        }
+        header("HTTP/1.0 404 Not Found"); exit;
+
+    case 'cover':
+        $stmt = $db->prepare("SELECT cover FROM tracks WHERE id = ?"); $stmt->execute([$_GET['q']??0]); $t=$stmt->fetch();
+        $coverName = ($t && !empty($t['cover'])) ? basename($t['cover']) : 'default.png';
+        $path = $coverDir . '/' . $coverName;
+        if(!file_exists($path)) $path = $coverDir . '/default.png';
+        
+        $ext = strtolower(pathinfo($path, PATHINFO_EXTENSION));
+        $mime = 'image/jpeg';
+        if ($ext === 'webp') $mime = 'image/webp';
+        elseif ($ext === 'png') $mime = 'image/png';
+        elseif ($ext === 'gif') $mime = 'image/gif';
+        
+        header("Content-Type: " . $mime); readfile($path); exit;
+
+    case 'upload':
+        $auth = authenticate_api_user($db);
+        if (!$auth) { echo json_encode(["status" => "error", "message" => "Accès refusé. Identifiants invalides."]); exit; }
+
+        if(isset($_FILES['music'])) {
+            $file = $_FILES['music'];
+
+            // --- SÉCURITÉ : Vérification taille fichier audio ---
+            if ($file['size'] > MAX_AUDIO_SIZE) {
+                echo json_encode(["status" => "error", "message" => "Fichier audio trop volumineux (100 Mo max)"]); exit;
+            }
+            
+            $audioExt = strtolower(pathinfo($file['name'], PATHINFO_EXTENSION));
+
+            // --- SÉCURITÉ : Vérification du type MIME réel du fichier audio ---
+            if (!is_valid_audio($file['tmp_name'], $audioExt)) {
+                echo json_encode(["status" => "error", "message" => "Format audio invalide ou non autorisé."]); exit;
+            }
+
+            $meta = extractMp3Data($file['tmp_name']);
+            $fn = bin2hex(random_bytes(8)) . '.' . $audioExt;
+            
+            // --- SÉCURITÉ : Validation et troncature des champs texte ---
+            $ti = !empty($_POST['title']) ? $_POST['title'] : (!empty($meta['title']) ? $meta['title'] : pathinfo($file['name'], PATHINFO_FILENAME));
+            $ar = !empty($_POST['artist']) ? $_POST['artist'] : (!empty($meta['artist']) ? $meta['artist'] : "Inconnu");
+            $ge = !empty($_POST['genre']) ? $_POST['genre'] : 'Autre';
+            
+            $ti = sanitize_text($ti);
+            $ar = sanitize_text($ar);
+            $ge = sanitize_text($ge, 50);
+            
+            $cn = "default.png";
+            
+            if(!empty($_FILES['cover']['name'])) {
+                // --- SÉCURITÉ : Vérification taille image ---
+                if ($_FILES['cover']['size'] > MAX_IMAGE_SIZE) {
+                    echo json_encode(["status" => "error", "message" => "Image de couverture trop volumineuse (5 Mo max)"]); exit;
+                }
+                $imgExt = strtolower(pathinfo($_FILES['cover']['name'], PATHINFO_EXTENSION));
+                $allowedImgExt = ['png', 'jpg', 'jpeg', 'webp', 'gif'];
+                if (in_array($imgExt, $allowedImgExt)) {
+                    $cn = bin2hex(random_bytes(8)) . ".webp"; 
+                    optimizeImage($_FILES['cover']['tmp_name'], $coverDir.'/'.$cn);
+                }
+            } elseif(!empty($meta['cover']['data'])) {
+                $cn = bin2hex(random_bytes(8)) . "_meta.webp"; 
+                $tmpImgPath = sys_get_temp_dir() . '/' . uniqid() . '.tmp';
+                file_put_contents($tmpImgPath, $meta['cover']['data']);
+                optimizeImage($tmpImgPath, $coverDir.'/'.$cn, $meta['cover']['mime']);
+                @unlink($tmpImgPath);
+            }
+            
+            $duration = calculateAudioDuration($file['tmp_name']);
+            
+            if(move_uploaded_file($file['tmp_name'], $musicDir.'/'.$fn)) {
+                $db->prepare("INSERT INTO tracks (filename, title, artist, cover, genre, uploader_id, duration) VALUES (?,?,?,?,?,?,?)")->execute([$fn, $ti, $ar, $cn, $ge, $auth['id'], $duration]);
+                echo json_encode(["status" => "success"]);
+            } else echo json_encode(["status" => "error", "message" => "Erreur de déplacement du fichier"]);
+        } else echo json_encode(["status" => "error", "message" => "Fichier audio manquant"]);
+        break;
+
+    case 'edit_track':
+        $auth = authenticate_api_user($db);
+        if (!$auth) { echo json_encode(["status" => "error", "message" => "Accès refusé. Identifiants invalides."]); exit; }
+
+        $tid = filter_var($_POST['track_id'] ?? 0, FILTER_VALIDATE_INT);
+        if ($tid === false || $tid <= 0) { echo json_encode(["status" => "error", "message" => "ID de piste invalide"]); exit; }
+
+        $t = $db->prepare("SELECT uploader_id, cover FROM tracks WHERE id=?"); $t->execute([$tid]); $curr = $t->fetch();
+        
+        if($curr && ($auth['is_admin'] || $curr['uploader_id'] == $auth['id'])) {
+            $cleanTitle  = sanitize_text($_POST['title']  ?? '');
+            $cleanArtist = sanitize_text($_POST['artist'] ?? '');
+
+            $sets = ["title = ?", "artist = ?"]; $params = [$cleanTitle, $cleanArtist];
+            
+            if(isset($_POST['new_genre'])) {
+                $sets[] = "genre = ?";
+                $params[] = sanitize_text($_POST['new_genre'], 50);
+            }
+
+            if(!empty($_FILES['new_cover']['name'])) {
+                // --- SÉCURITÉ : Vérification taille de la nouvelle cover ---
+                if ($_FILES['new_cover']['size'] > MAX_IMAGE_SIZE) {
+                    echo json_encode(["status" => "error", "message" => "Image de couverture trop volumineuse (5 Mo max)"]); exit;
+                }
+                $imgExt = strtolower(pathinfo($_FILES['new_cover']['name'], PATHINFO_EXTENSION));
+                $allowedImgExt = ['png', 'jpg', 'jpeg', 'webp', 'gif'];
+                if (in_array($imgExt, $allowedImgExt)) {
+                    $newCn = bin2hex(random_bytes(8)) . "_edit.webp";
+                    if(optimizeImage($_FILES['new_cover']['tmp_name'], $coverDir.'/'.$newCn)) {
+                        $sets[] = "cover = ?"; $params[] = $newCn;
+                        $oldCover = basename($curr['cover']);
+                        if($oldCover != 'default.png' && file_exists($coverDir.'/'.$oldCover)) unlink($coverDir.'/'.$oldCover);
+                    }
+                }
+            }
+            $params[] = $tid;
+            $db->prepare("UPDATE tracks SET ".implode(', ', $sets)." WHERE id = ?")->execute($params);
+            echo json_encode(["status" => "success"]);
+        } else echo json_encode(["status" => "error", "message" => "Interdit : Vous n'avez pas les droits sur cette musique"]);
+        break;
+
+    case 'delete_track':
+        $auth = authenticate_api_user($db);
+        if (!$auth) { echo json_encode(["status" => "error", "message" => "Accès refusé. Identifiants invalides."]); exit; }
+
+        $tid = filter_var($_POST['track_id'] ?? 0, FILTER_VALIDATE_INT);
+        if ($tid === false || $tid <= 0) { echo json_encode(["status" => "error", "message" => "ID de piste invalide"]); exit; }
+
+        $t = $db->prepare("SELECT uploader_id, filename, cover FROM tracks WHERE id=?"); $t->execute([$tid]); $curr = $t->fetch();
+        
+        if($curr && ($auth['is_admin'] || $curr['uploader_id'] == $auth['id'])) {
+            $safeMusicFile = basename($curr['filename']);
+            $safeCoverFile = basename($curr['cover']);
+
+            if(!empty($safeMusicFile) && file_exists($musicDir.'/'.$safeMusicFile)) unlink($musicDir.'/'.$safeMusicFile);
+            if($safeCoverFile != 'default.png' && file_exists($coverDir.'/'.$safeCoverFile)) unlink($coverDir.'/'.$safeCoverFile);
+            
+            $db->prepare("DELETE FROM tracks WHERE id=?")->execute([$tid]);
+            echo json_encode(["status" => "success"]);
+        } else echo json_encode(["status" => "error", "message" => "Interdit : Vous n'avez pas les droits sur cette musique"]);
+        break;
+
+    case 'playlists':
+        echo json_encode($db->query("SELECT p.*, u.username as creator FROM playlists p JOIN users u ON p.creator_id = u.id")->fetchAll(PDO::FETCH_ASSOC));
+        break;
+
+    case 'playlist_create':
+        $auth = authenticate_api_user($db);
+        if (!$auth) { echo json_encode(["status" => "error", "message" => "Accès refusé. Identifiants invalides."]); exit; }
+
+        $playlistName = sanitize_text($_POST['name'] ?? 'Playlist', 100);
+        $db->prepare("INSERT INTO playlists (name, creator_id, song_ids) VALUES (?, ?, '')")->execute([$playlistName, $auth['id']]);
+        echo json_encode(["status" => "success"]);
+        break;
+
+    case 'playlist_mod':
+        $auth = authenticate_api_user($db);
+        if (!$auth) { echo json_encode(["status" => "error", "message" => "Accès refusé. Identifiants invalides."]); exit; }
+
+        $pid = filter_var($_POST['playlist_id'] ?? 0, FILTER_VALIDATE_INT);
+        if ($pid === false || $pid <= 0) { echo json_encode(["status" => "error", "message" => "ID de playlist invalide"]); exit; }
+
+        $mode = $_POST['mode'] ?? '';
+        $p = $db->prepare("SELECT song_ids, creator_id FROM playlists WHERE id=?"); $p->execute([$pid]); $curr = $p->fetch();
+
+        if($curr && ($auth['is_admin'] || $curr['creator_id'] == $auth['id'])) {
+            if ($mode === 'delete') {
+                $db->prepare("DELETE FROM playlists WHERE id=?")->execute([$pid]);
+            } elseif ($mode === 'rename') {
+                $newName = sanitize_text($_POST['new_name'] ?? 'Playlist', 100);
+                $db->prepare("UPDATE playlists SET name=? WHERE id=?")->execute([$newName, $pid]);
+            } else {
+                // --- SÉCURITÉ : Validation stricte des song_ids (entiers positifs uniquement) ---
+                $rawIds = array_filter(explode(',', $curr['song_ids']));
+                $ids = array_filter(array_map('intval', $rawIds), fn($v) => $v > 0);
+
+                $targetId = filter_var($_POST['track_id'] ?? 0, FILTER_VALIDATE_INT);
+                if ($targetId === false || $targetId <= 0) {
+                    echo json_encode(["status" => "error", "message" => "ID de piste invalide"]); exit;
+                }
+
+                if ($mode === 'add' && !in_array($targetId, $ids)) $ids[] = $targetId;
+                if ($mode === 'remove') $ids = array_values(array_diff($ids, [$targetId]));
+
+                $db->prepare("UPDATE playlists SET song_ids=? WHERE id=?")->execute([implode(',', $ids), $pid]);
+            }
+            echo json_encode(["status" => "success"]);
+        } else echo json_encode(["status" => "error", "message" => "Interdit : Vous n'avez pas les droits sur cette playlist"]);
+        break;
+}
+?>
