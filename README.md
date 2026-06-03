@@ -55,3 +55,7 @@ To run Purple Music, you only need:
    nano setup.sql
    # change the mysql password
    mysql -u root -p < setup.sql
+   ```
+
+This project is a fork of PurpleMusic (MIT License)
+Original author: Axolat (https://github.com/Axolat000/PurpleMusic)
